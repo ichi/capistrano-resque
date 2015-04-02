@@ -1,3 +1,5 @@
+require 'timeout'
+
 namespace :load do
   task :defaults do
     set :workers, {"*" => 1}
@@ -8,6 +10,7 @@ namespace :load do
     set :resque_verbose, true
     set :resque_pid_path, -> { File.join(shared_path, 'tmp', 'pids') }
     set :resque_dynamic_schedule, false
+    set :resque_shutdown_timeout, 10
   end
 end
 
@@ -44,6 +47,17 @@ namespace :resque do
     end
   end
 
+  def wait_for(msg = nil)
+    Timeout.timeout(fetch(:resque_shutdown_timeout)) do
+      info "Waiting for #{msg}" if msg
+      loop do
+        break if yield
+        sleep 1
+        info '.'
+      end
+    end
+  end
+
   desc "See current worker status"
   task :status do
     on roles(*workers_roles) do
@@ -68,9 +82,9 @@ namespace :resque do
         workers.each_pair do |queue, number_of_workers|
           info "Starting #{number_of_workers} worker(s) with QUEUE: #{queue}"
           number_of_workers.times do
-            pid = "#{fetch(:resque_pid_path)}/resque_work_#{worker_id}.pid"
+            pid_file = "#{fetch(:resque_pid_path)}/resque_work_#{worker_id}.pid"
             within current_path do
-              execute :nohup, %{#{SSHKit.config.command_map[:rake]} RAILS_ENV=#{rails_env} QUEUE="#{queue}" PIDFILE=#{pid} BACKGROUND=yes #{"VERBOSE=1 " if fetch(:resque_verbose)}INTERVAL=#{fetch(:interval)} #{"environment " if fetch(:resque_environment_task)}resque:work #{output_redirection}}
+              execute :nohup, %{#{SSHKit.config.command_map[:rake]} RAILS_ENV=#{rails_env} QUEUE="#{queue}" PIDFILE=#{pid_file} BACKGROUND=yes #{"VERBOSE=1 " if fetch(:resque_verbose)}INTERVAL=#{fetch(:interval)} #{"environment " if fetch(:resque_environment_task)}resque:work #{output_redirection}}
             end
             worker_id += 1
           end
@@ -95,6 +109,9 @@ namespace :resque do
             pid = capture(:cat, pid_file)
             if test "kill -0 #{pid} > /dev/null 2>&1"
               execute :kill, "-s #{fetch(:resque_kill_signal)} #{pid} && rm #{pid_file}"
+
+              # waiting for shutting down...
+              wait_for("shutting down resque-worker[#{pid}]") { not test("kill -0 #{pid} > /dev/null 2>&1") }
             else
               info "Process #{pid} from #{pid_file} is not running, cleaning up stale PID file"
               execute :rm, pid_file
@@ -117,9 +134,9 @@ namespace :resque do
     desc "See current scheduler status"
     task :status do
       on roles :resque_scheduler do
-        pid = "#{fetch(:resque_pid_path)}/scheduler.pid"
+        pid_file = "#{fetch(:resque_pid_path)}/scheduler.pid"
         if test "[ -e #{pid} ]"
-          info capture(:ps, "-f -p $(cat #{pid}) | sed -n 2p")
+          info capture(:ps, "-f -p $(cat #{pid_file}) | sed -n 2p")
         end
       end
     end
@@ -128,9 +145,9 @@ namespace :resque do
     task :start do
       on roles :resque_scheduler do
         create_pid_path
-        pid = "#{fetch(:resque_pid_path)}/scheduler.pid"
+        pid_file = "#{fetch(:resque_pid_path)}/scheduler.pid"
         within current_path do
-          execute :nohup, %{#{SSHKit.config.command_map[:rake]} RAILS_ENV=#{rails_env} PIDFILE=#{pid} BACKGROUND=yes #{"VERBOSE=1 " if fetch(:resque_verbose)}MUTE=1 #{"DYNAMIC_SCHEDULE=yes " if fetch(:resque_dynamic_schedule)}#{"environment " if fetch(:resque_environment_task)}resque:scheduler #{output_redirection}}
+          execute :nohup, %{#{SSHKit.config.command_map[:rake]} RAILS_ENV=#{rails_env} PIDFILE=#{pid_file} BACKGROUND=yes #{"VERBOSE=1 " if fetch(:resque_verbose)}MUTE=1 #{"DYNAMIC_SCHEDULE=yes " if fetch(:resque_dynamic_schedule)}#{"environment " if fetch(:resque_environment_task)}resque:scheduler #{output_redirection}}
         end
       end
     end
@@ -138,9 +155,13 @@ namespace :resque do
     desc "Stops resque scheduler"
     task :stop do
       on roles :resque_scheduler do
-        pid = "#{fetch(:resque_pid_path)}/scheduler.pid"
-        if test "[ -e #{pid} ]"
-          execute :kill, "-s #{fetch(:resque_kill_signal)} $(cat #{pid}); rm #{pid}"
+        pid_file = "#{fetch(:resque_pid_path)}/scheduler.pid"
+        if test "[ -e #{pid_file} ]"
+          pid = capture(:cat, pid_file)
+          execute :kill, "-s #{fetch(:resque_kill_signal)} #{pid}; rm #{pid_file}"
+
+          # waiting for shutting down...
+          wait_for("shutting down resque-scheduler[#{pid}]") { not test("kill -0 #{pid} > /dev/null 2>&1") }
         end
       end
     end
